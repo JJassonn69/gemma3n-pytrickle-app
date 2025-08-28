@@ -1,0 +1,39 @@
+version: "3.9"
+services:
+  vllm:
+    # Use the prebuilt image you published (update tag if not latest)
+    image: jjassonn69/vllm-client:latest
+    container_name: vllm-server
+    pull_policy: always
+    env_file:
+      - .env
+    # Any args here override default vLLM args in start.sh
+    command: >
+      --model google/gemma-3n-E4B-it
+      --dtype bfloat16
+      --gpu-memory-utilization 0.90
+      --max-model-len 32768
+      --port 9000
+    environment:
+      - HF_HOME=/data/hf
+      - HUGGINGFACE_HUB_CACHE=/data/hf
+      - TRANSFORMERS_CACHE=/data/hf
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - VLLM_LOGGING_LEVEL=INFO
+      - VLLM_ALLOW_HTTP=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - APP_PORT=8000
+    ports:
+      - "8000:8000"  # app server
+      - "9000:9000"  # vLLM API
+    volumes:
+      - vllm-cache:/data/hf
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/v1/models > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 20
+    runtime: nvidia
+
+volumes:
+  vllm-cache:
