@@ -5,10 +5,10 @@ This application provides a headless PyTrickle streaming server for the `google/
 ## Features
 
 - **Media Passthrough**: Video and audio streams are passed through unmodified.
-- **Separate Data Channel**: Generated text is sent over the Trickle `data_url` as newline-delimited JSON, not overlaid on the video.
+- **Separate Data Channel**: Generated text is sent over the Trickle `data_url` as newline-delimited JSON.
 - **Real-time Prompt Updates**: The generation prompt and other parameters can be updated in real-time.
 - **Configurable Sampling**: Frame sampling, generation cadence, and token limits are all configurable.
-- **Resource Aware**: Implements token gating and optional frame downscaling to manage model load and prevent OOM errors.
+- **Resource Aware**: Optional frame downscaling to manage model load and prevent OOM errors.
 
 ## Setup
 
@@ -21,8 +21,21 @@ This application provides a headless PyTrickle streaming server for the `google/
     ```bash
     python app.py
     ```
+The server will start on `http://localhost:8000`.    
 
-The server will start on `http://localhost:8000`.
+3. **Run the provided compose file to build and start vllm backend**
+    ```bash
+    docker compose -f docker-compose.run.yml up
+    ```
+This takes about 15 minutes to completely load the model and start the endpoint on `port 9000`.
+
+### Alternatively you can also create a docker image with both app and the vllm backend
+
+1. **Run the compose command from the root of the directory.**
+    ```bash
+    docker compose -f docker-compose.yml up
+    ```
+This will create docker image with the necessary `start.sh`script to both vllm backend and app in a single container. The ports available will be the same as above `8000` and `9000`.
 
 ## Usage
 

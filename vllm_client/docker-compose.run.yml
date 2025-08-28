@@ -1,10 +1,11 @@
 version: "3.9"
 services:
   vllm:
-    # Use the prebuilt image you published (update tag if not latest)
-    image: jjassonn69/vllm-client:latest
+    build:
+      # Build from repo root so Dockerfile can COPY app files
+      context: ..
+      dockerfile: vllm_client/Dockerfile.vllm.base
     container_name: vllm-server
-    pull_policy: always
     env_file:
       - .env
     # Any args here override default vLLM args in start.sh
@@ -19,12 +20,12 @@ services:
       - HUGGINGFACE_HUB_CACHE=/data/hf
       - TRANSFORMERS_CACHE=/data/hf
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - HUGGINGFACEHUB_API_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - VLLM_LOGGING_LEVEL=INFO
       - VLLM_ALLOW_HTTP=1
       - NVIDIA_VISIBLE_DEVICES=all
-      - APP_PORT=8000
     ports:
-      - "8000:8000"  # app server
       - "9000:9000"  # vLLM API
     volumes:
       - vllm-cache:/data/hf

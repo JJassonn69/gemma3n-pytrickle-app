@@ -13,7 +13,7 @@ RUN pip install -U -q git+https://github.com/huggingface/transformers.git && \
     pip install "timm>=1.0.16"
 
 # Install audio extras for vLLM (if not already present in base). Keep uv if available.
-RUN pip install "vllm[audio]==0.10.1"
+RUN pip install "vllm[audio]>=0.10.1"
 
 # App directory and Python deps
 WORKDIR /app
