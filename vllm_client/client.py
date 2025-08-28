@@ -54,6 +54,9 @@ class VLLMClient:
         if audio.ndim == 2:
             audio = audio.mean(axis=1)
         audio = audio.astype(np.float32, copy=False)
+
+        # Clip to [-1, 1] before writing PCM_16
+        audio = np.clip(audio, -1.0, 1.0)
         
         # Ensure minimum duration for Gemma 3n (at least 1 second to avoid kernel size issues)
         min_samples = sr  # 1 second

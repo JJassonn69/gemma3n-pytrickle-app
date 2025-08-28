@@ -31,6 +31,7 @@ class AppConfig:
     max_new_tokens: int = 3000
     temperature: float = 0.2
     top_p: float = 0.95
+    request_timeout_s: float = 4.0
 
     # Video sampling params
     target_fps: int = 7
@@ -68,9 +69,10 @@ class AppState:
 
     # Timing & Control
     last_data_time: float = 0.0
-    idle_timeout_s: float = 10.0
+    idle_timeout_s: float = 5.0
     watcher_task: asyncio.Task | None = None
     trigger_generation: bool = True
+    last_video_time: float = 0.0
 
     # PyTrickle server reference
     server: Any = None
@@ -106,10 +108,10 @@ async def process_video(frame: VideoFrame) -> VideoFrame:
     if config.modality != 'vision':
         return frame
     now = time.time()
-    if (now - state.last_data_time) < (1.0 / config.target_fps):
+    if (now - state.last_video_time) < (1.0 / config.target_fps):
         return frame
 
-    state.last_data_time = now
+    state.last_video_time = now
 
     if state.trigger_generation and (state.watcher_task is None or state.watcher_task.done()):
         # Start background watcher task on the SAME loop
@@ -228,11 +230,15 @@ def update_params(params: dict):
                     if mod not in { 'text', 'vision', 'audio' }:
                         raise ValueError("modality must be one of 'text', 'vision', 'audio'")
                     setattr(config, key, mod)
-                    # Set default prompt based on modality
-                    if mod == 'audio':
-                        config.prompt = "Transcribe the audio"
-                    elif mod == 'vision':
-                        config.prompt = "Describe whats happening in the images in short sentences."
+                    # Set default prompt based on modality only if prompt not provided in params
+                    if 'prompt' not in params:
+                        if mod == 'audio':
+                            config.prompt = "Transcribe the audio into the language spoken in the audio"
+                        elif mod == 'vision':
+                            config.prompt = "Describe whats happening in the images in short sentences."
+                    elif key == 'prompt':
+                        # Always update prompt if provided
+                        setattr(config, key, str(value))
                 else:
                     target_type = type(getattr(AppConfig(), key))
                     setattr(config, key, target_type(value))
@@ -315,7 +321,7 @@ async def run_generation_loop():
                             top_p=config.top_p,
                             stream=False,
                         ),
-                        timeout=int(config.audio_window_s/2),
+                        timeout=int(config.request_timeout_s),
                     )
                 except asyncio.TimeoutError:
                     logger.error("vLLM chat timed out; skipping cycle.")
@@ -342,11 +348,13 @@ async def run_generation_loop():
                     }
                 }
                 try:
+                    # Do we send both uncorrected and corrected payload for audio?
                     if not config.correction_enabled or config.modality=="vision":
-                        await state.server.current_client.publish_data(json.dumps(payload))
-                        logger.info("Published transcript correction to data_url.")
+                        if getattr(state.server, "current_client", None):
+                            await state.server.current_client.publish_data(json.dumps(payload))
+                            logger.info("Published generation payload to data_url.")
                 except Exception as e:
-                    logger.error(f"Failed to publish correction payload: {e}")
+                    logger.error(f"Failed to publish generation payload: {e}")
                 timings = payload["stats"]["timings_ms"]
                 logger.info(f"Cycle {cycle_id} timings (ms): generate={timings['generate']}")
 
@@ -356,8 +364,8 @@ async def run_generation_loop():
                         config.modality == 'audio'
                         and config.correction_enabled
                         and isinstance(generated_text, str)
-                        and generated_text.strip() != ""
-                    ):
+                        and generated_text.strip() != ""):
+
                         latest_raw = generated_text.strip()
 
                         # Append to history and trim
@@ -374,15 +382,19 @@ async def run_generation_loop():
                         )
 
                         t_corr_start = time.perf_counter()
-                        corrected_text = state.vllm_client.chat(
-                            prompt=corr_prompt,
-                            images=None,
-                            audio=None,
-                            max_tokens=min(512, config.max_new_tokens),
-                            temperature=min(0.5, config.temperature),
-                            top_p=config.top_p,
-                            stream=False,
-                        )
+                        corrected_text = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                state.vllm_client.chat,
+                                prompt=corr_prompt,
+                                images=None,
+                                audio=None,
+                                max_tokens=min(512, config.max_new_tokens),
+                                temperature=min(0.5, config.temperature),
+                                top_p=config.top_p,
+                                stream=False,
+                        ),
+                        timeout= float(config.request_timeout_s),)
+
                         t_corr_end = time.perf_counter()
 
                         corr_payload = {
@@ -401,8 +413,9 @@ async def run_generation_loop():
                         }
 
                         try:
-                            await state.server.current_client.publish_data(json.dumps(corr_payload))
-                            logger.info("Published transcript correction to data_url.")
+                            if getattr(state.server, "current_client", None):
+                                await state.server.current_client.publish_data(json.dumps(corr_payload))
+                                logger.info("Published transcript correction payload to data_url.")
                         except Exception as e:
                             logger.error(f"Failed to publish correction payload: {e}")
                             continue
