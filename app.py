@@ -69,7 +69,7 @@ class AppState:
 
     # Timing & Control
     last_data_time: float = 0.0
-    idle_timeout_s: float = 5.0
+    idle_timeout_s: float = 1.0
     watcher_task: asyncio.Task | None = None
     trigger_generation: bool = True
     last_video_time: float = 0.0
@@ -287,10 +287,12 @@ async def run_generation_loop():
             now = time.time()
             idle = (now - state.last_data_time) > state.idle_timeout_s
 
-            if idle and state.last_data_time != 0:
+            if idle:
+                logger.debug("No longer receiving segments breaking generation loop")
                 break
             elif not should_run:
-                continue
+                logger.debug("NNo longer receivinelected or buffer empty.")
+                break
 
             cycle_id = str(uuid.uuid4())
             logger.info(f"Starting generation cycle {cycle_id}")
