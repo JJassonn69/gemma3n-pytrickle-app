@@ -1,4 +1,4 @@
-git+https://github.com/livepeer/pytrickle.git
+git+https://github.com/livepeer/pytrickle.git@e0f49a9121344468f7ac6b63a5555bd78389476f
 openai>=1.35.0
 Pillow>=10.0.0
 soundfile>=0.12.1

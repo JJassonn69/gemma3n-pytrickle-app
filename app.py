@@ -97,6 +97,22 @@ def load_model(**kwargs):
         from vllm_client import get_client as get_vllm_client
         state.vllm_client = get_vllm_client()
         logger.info(f"VLLM client initialized. Base URL: {os.getenv('VLLM_BASE_URL', 'http://localhost:9000/v1')}")
+        logger.info("Worker ready, performing quick warmup call to vLLM...")
+        
+        try:
+            green_img = Image.new("RGB", (224, 224), color=(0, 255, 0))
+            warmup = state.vllm_client.chat(
+                prompt="Warmup.",
+                images=[green_img],
+                audio=None,
+                max_tokens=8,
+                temperature=0.0,
+                stream=False,
+            )
+            logger.info(f"Warmup with vLLM complete with result: {warmup}")
+        except Exception as e:
+            logger.warning(f"Warmup failed: {e}")
+
     except Exception as e:
         logger.error(f"Failed to initialize VLLM client: {e}")
         raise RuntimeError("VLLM client is required for this application") from e
@@ -218,7 +234,7 @@ async def process_audio(audioframe: AudioFrame) -> list[AudioFrame]:
     return [audioframe] # Pass-through
 
 
-def update_params(params: dict):
+async def update_params(params: dict):
     """Updates application configuration from server requests."""
     logger.info(f"Updating parameters: {params}")
     for key, value in params.items():
