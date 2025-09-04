@@ -26,12 +26,20 @@ class AppConfig:
     modality: str = "audio"
 
     # Generation params
-    prompt: str = "Transcribe the audio into the laguage spoken in the audio"
-    generate_every_s: float = 3.0
+    vision_prompt: str = """
+    You are an expert video analysis provider that balances detail and broad understanding of video provided.
+    Describe the video frame in context of previous frames.  First sentence should be what changed, next list details of the frame to use for reference in next frame analysis.
+    Do not include leading text like 'this image shows', 'this video depicts',
+    Example response:
+    The individual remains in similar position looking at the camera.  Background is plain, individual is a man, wearing read shirt, glasses, white earbuds in ears.
+    A rabbit has entered the scene from the left.  Tall trees, wet ground, fog in the distance.
+    """
+
+    audio_prompt: str = "Transcribe the audio to the language it is spoken."
+    generate_every_s: float = 0.2
+    max_buffer_s: float = 8.0
     max_new_tokens: int = 3000
-    temperature: float = 0.2
-    top_p: float = 0.95
-    request_timeout_s: float = 4.0
+    request_timeout_s: float = 6.0
 
     # Video sampling params
     target_fps: int = 7
@@ -47,8 +55,8 @@ class AppConfig:
     server_port: int = 8000
 
     # Transcript correction settings (post-audio generation)
-    correction_enabled: bool = True
-    history_max_turns: int = 10
+    correction_enabled: bool = False
+    history_max_turns: int = 5
     correction_system_hint: str = (
         "You are an ASR post-processor. Use the provided history to correct the latest transcript. "
         "Fix homophones, merge split/partial words, and prefer likely phrases based on context. "
@@ -76,12 +84,13 @@ class AppState:
 
     # PyTrickle server reference
     server: Any = None
+    processor: Any = None
 
     # Diagnostics
     last_audio_log_time: float = 0.0
 
     # Transcription history (raw, as produced by first pass)
-    transcript_history: deque = field(default_factory=deque)  # deque[str]
+    generation_history: deque = field(default_factory=deque)  # deque[str]
 
 # Global instances
 config = AppConfig()
@@ -106,7 +115,6 @@ def load_model(**kwargs):
                 images=[green_img],
                 audio=None,
                 max_tokens=8,
-                temperature=0.0,
                 stream=False,
             )
             logger.info(f"Warmup with vLLM complete with result: {warmup}")
@@ -214,8 +222,8 @@ async def process_audio(audioframe: AudioFrame) -> list[AudioFrame]:
             state.audio_chunks.append(samples)
             state.audio_samples_total += samples.shape[0]
 
-            # Enforce sliding window duration
-            max_samples = int(config.audio_sample_rate * config.audio_window_s)
+            # Enforce larger sliding window for overlap (changed from 4.0 to config.max_buffer_s)
+            max_samples = int(config.audio_sample_rate * config.max_buffer_s)
             while state.audio_samples_total > max_samples and state.audio_chunks:
                 removed = state.audio_chunks.popleft()
                 state.audio_samples_total -= len(removed)
@@ -249,9 +257,9 @@ async def update_params(params: dict):
                     # Set default prompt based on modality only if prompt not provided in params
                     if 'prompt' not in params:
                         if mod == 'audio':
-                            config.prompt = "Transcribe the audio into the language spoken in the audio"
+                            config.audio_prompt = "Transcribe the audio into the language spoken in the audio"
                         elif mod == 'vision':
-                            config.prompt = "Describe whats happening in the images in short sentences."
+                            config.vision_prompt = "Describe whats happening in the images in short sentences."
                     elif key == 'prompt':
                         # Always update prompt if provided
                         setattr(config, key, str(value))
@@ -271,16 +279,22 @@ async def run_generation_loop():
         while True:
             await asyncio.sleep(config.generate_every_s)
 
-            # Snapshot current buffers without swapping
             async with state.buffer_lock:
                 pil_images = list(state.video_frames) if config.modality == 'vision' else []
-                audio_chunks = list(state.audio_chunks) if config.modality == 'audio' else []
-                audio_samples_total = state.audio_samples_total if config.modality == 'audio' else 0
+                # Changed: Extract only the last 4 seconds for overlap
+                audio_data = None
+                if config.modality == 'audio':
+                    audio_data = get_last_n_seconds_audio(
+                        state.audio_chunks, state.audio_samples_total, 4.0, config.audio_sample_rate
+                    )
+                    if audio_data is None:
+                        logger.debug("Not enough audio for 4s window; skipping generation.")
+                        continue
 
             # Determine if we should run a cycle based on modality
             should_run = (
                 (config.modality == 'vision' and bool(pil_images)) or
-                (config.modality == 'audio' and audio_samples_total > 0) or
+                (config.modality == 'audio' and state.audio_samples_total > 0) or
                 (config.modality == 'text')
             )
 
@@ -302,9 +316,9 @@ async def run_generation_loop():
                 audio_data = None
 
                 # Prepare audio for audio modality
-                if config.modality == 'audio' and audio_chunks:
+                if config.modality == 'audio' and state.audio_chunks:
                     try:
-                        audio_data = np.concatenate(audio_chunks, axis=0).astype(np.float32, copy=False)
+                        audio_data = np.concatenate(state.audio_chunks, axis=0).astype(np.float32, copy=False)
                     except Exception as e:
                         logger.warning(f"Failed to concatenate audio; skipping cycle: {e}")
                         # Skip this cycle to avoid sending empty audio to the model
@@ -330,13 +344,11 @@ async def run_generation_loop():
                     generated_text = await asyncio.wait_for(
                         asyncio.to_thread(
                             state.vllm_client.chat,
-                            prompt=config.prompt,
+                            prompt=config.audio_prompt if config.modality == "audio" else config.vision_prompt,
                             images=pil_images if pil_images else None,
-                            audio=audio_data,
+                            audio= audio_data,
                             audio_sr=config.audio_sample_rate,
                             max_tokens=config.max_new_tokens,
-                            temperature=config.temperature,
-                            top_p=config.top_p,
                             stream=False,
                         ),
                         timeout=int(config.request_timeout_s),
@@ -350,11 +362,31 @@ async def run_generation_loop():
 
                 t_gen_end = time.perf_counter()
 
+                # Append to history and trim
+                state.generation_history.append(generated_text)
+                while len(state.generation_history) > 3:
+                    state.generation_history.popleft()
+
+                 
+                # Reconstruct prompt with history
+                if config.modality == "vision":
+                    config.vision_prompt = """
+                        You are an expert video analysis provider that balances detail and broad understanding of video provided.
+                        Describe the video frame in context of previous frames.  First sentence should be what changed, next list details of the frame to use for reference in next frame analysis.
+                        Do not include leading text like 'this image shows', 'this video depicts', After the first run you will get result of a pass through the model. Compare the previous understanding
+                        and create the new one based on interpretations for history. Instead, merge the histories into a continuous, flowing storyline.Focus on the core events, actions, and changes across
+                        histories. Ignore irrelevant or redundant details. Present the story in a way that feels natural, consistent, and temporally connected. Ensure that each new request builds on the prior understanding.
+                        Example response:
+                        The individual remains in similar position looking at the camera.  Background is plain, individual is a man, wearing read shirt, glasses, white earbuds in ears.
+                        A rabbit has entered the scene from the left.  Tall trees, wet ground, fog in the distance.
+                        """
+                    for i, history_text in enumerate(state.generation_history):
+                        config.vision_prompt += f"\nHistory {i+1}: {history_text}"
+
                 payload = {
                     "type": "generation",
                     "timestamp_ms": int(time.time() * 1000),
                     "cycle_id": cycle_id,
-                    "prompt": config.prompt,
                     "text": generated_text,
                     "stats": {
                         "frame_count": len(pil_images),
@@ -368,15 +400,14 @@ async def run_generation_loop():
                 try:
                     # Do we send both uncorrected and corrected payload for audio?
                     if not config.correction_enabled or config.modality=="vision":
-                        if getattr(state.server, "current_client", None):
-                            await state.server.current_client.publish_data(json.dumps(payload))
-                            logger.info("Published generation payload to data_url.")
+                        await state.processor.send_data(json.dumps(payload))
+                        logger.info("Published generation payload to data_url.")
                 except Exception as e:
                     logger.error(f"Failed to publish generation payload: {e}")
                 timings = payload["stats"]["timings_ms"]
                 logger.info(f"Cycle {cycle_id} timings (ms): generate={timings['generate']}")
 
-                # Follow-up: text-only correction using rolling history (audio modality only)
+                # Follow-up: text-only correction using rolling history
                 try:
                     if (
                         config.modality == 'audio'
@@ -387,12 +418,12 @@ async def run_generation_loop():
                         latest_raw = generated_text.strip()
 
                         # Append to history and trim
-                        state.transcript_history.append(latest_raw)
-                        while len(state.transcript_history) > config.history_max_turns:
-                            state.transcript_history.popleft()
+                        state.generation_history.append(latest_raw)
+                        while len(state.generation_history) > config.history_max_turns:
+                            state.generation_history.popleft()
 
                         # Build correction prompt
-                        prev_history = list(state.transcript_history)[:-1]
+                        prev_history = list(state.generation_history)[:-1]
                         corr_prompt = build_correction_prompt(
                             history=prev_history,
                             latest=latest_raw,
@@ -407,8 +438,6 @@ async def run_generation_loop():
                                 images=None,
                                 audio=None,
                                 max_tokens=min(512, config.max_new_tokens),
-                                temperature=min(0.5, config.temperature),
-                                top_p=config.top_p,
                                 stream=False,
                         ),
                         timeout= float(config.request_timeout_s),)
@@ -416,7 +445,7 @@ async def run_generation_loop():
                         t_corr_end = time.perf_counter()
 
                         corr_payload = {
-                            "type": "transcript_correction",
+                            "type": "transcription_correction",
                             "timestamp_ms": int(time.time() * 1000),
                             "cycle_id": cycle_id,
                             "history_len": len(prev_history),
@@ -431,9 +460,8 @@ async def run_generation_loop():
                         }
 
                         try:
-                            if getattr(state.server, "current_client", None):
-                                await state.server.current_client.publish_data(json.dumps(corr_payload))
-                                logger.info("Published transcript correction payload to data_url.")
+                            await state.processor.send_data(json.dumps(corr_payload))
+                            logger.info("Published transcript correction payload to data_url.")
                         except Exception as e:
                             logger.error(f"Failed to publish correction payload: {e}")
                             continue
@@ -479,6 +507,31 @@ def build_correction_prompt(
     )
     return "\n".join(lines)
 
+# --- Helper Function ----
+
+def get_last_n_seconds_audio(audio_chunks: deque, audio_samples_total: int, n_seconds: float, sample_rate: int) -> np.ndarray | None:
+    """Extract the last N seconds of audio from the deque without modifying it."""
+    if audio_samples_total < n_seconds * sample_rate:
+        return None  # Not enough data
+    
+    target_samples = int(n_seconds * sample_rate)
+    accumulated = []
+    total_accumulated = 0
+
+    # Iterate from the end of the deque
+    for chunk in reversed(audio_chunks):
+        accumulated.insert(0, chunk)  # Prepend to maintain order
+        total_accumulated += len(chunk)
+        if total_accumulated >= target_samples:
+            break
+
+    # Concatenate and trim to exactly target_samples
+    audio_data = np.concatenate(accumulated)
+    if len(audio_data) > target_samples:
+        audio_data = audio_data[-target_samples:]  # Take the last part
+    return audio_data    
+
+
 # --- Main Execution ---
 
 async def main():
@@ -486,12 +539,13 @@ async def main():
     processor = StreamProcessor(
         video_processor=process_video,
         audio_processor=process_audio,
-        model_loader=load_model,
+        model_loader=load_model(),
         param_updater=update_params,
         name="multimodal-understanding-gemma3n",
         port=config.server_port,
     )
     state.server = processor.server
+    state.processor = processor
 
     # Start HTTP server (aiohttp) on the current event loop
     await processor.server.run_forever()
