@@ -18,7 +18,6 @@ RUN pip install "vllm[audio]>=0.10.1"
 # Defaults (override in compose/env)
 ENV HF_HOME=/data/hf \
     HUGGINGFACE_HUB_CACHE=/data/hf \
-    TRANSFORMERS_CACHE=/data/hf \
     VLLM_LOGGING_LEVEL=INFO \
     VLLM_BASE_URL=http://127.0.0.1:9000/v1
 

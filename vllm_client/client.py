@@ -22,8 +22,10 @@ from typing import Generator, Iterable, List, Optional
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
+from dotenv import load_dotenv
 from PIL import Image
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +37,7 @@ class VLLMClient:
         api_key: Optional[str] = None,
     ) -> None:
         self.base_url = base_url or os.getenv("VLLM_BASE_URL", "http://localhost:9000/v1")
-        self.model_id = model_id or os.getenv("MODEL_ID", "google/gemma-3n-E4B-it")
+        self.model_id = model_id or os.getenv("MODEL_ID", "google/gemma-3n-E2B-it")
         self.api_key = api_key or os.getenv("VLLM_API_KEY", "EMPTY")
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
 

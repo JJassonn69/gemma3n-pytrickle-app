@@ -23,23 +23,20 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AppConfig:
     # Modality selection: one of 'text', 'vision', 'audio'
-    modality: str = "audio"
+    modality: str = "vision"
 
     # Generation params
     vision_prompt: str = """
     You are an expert video analysis provider that balances detail and broad understanding of video provided.
     Describe the video frame in context of previous frames.  First sentence should be what changed, next list details of the frame to use for reference in next frame analysis.
     Do not include leading text like 'this image shows', 'this video depicts',
-    Example response:
-    The individual remains in similar position looking at the camera.  Background is plain, individual is a man, wearing read shirt, glasses, white earbuds in ears.
-    A rabbit has entered the scene from the left.  Tall trees, wet ground, fog in the distance.
     """
 
     audio_prompt: str = "Transcribe the audio to the language it is spoken."
-    generate_every_s: float = 0.2
+    generate_every_s: float = 5
     max_buffer_s: float = 8.0
-    max_new_tokens: int = 3000
-    request_timeout_s: float = 6.0
+    max_new_tokens: int = 300
+    request_timeout_s: float = 8.0
 
     # Video sampling params
     target_fps: int = 7
@@ -55,8 +52,8 @@ class AppConfig:
     server_port: int = 8000
 
     # Transcript correction settings (post-audio generation)
-    correction_enabled: bool = False
-    history_max_turns: int = 5
+    correction_enabled: bool = True
+    history_max_turns: int = 4
     correction_system_hint: str = (
         "You are an ASR post-processor. Use the provided history to correct the latest transcript. "
         "Fix homophones, merge split/partial words, and prefer likely phrases based on context. "
@@ -345,7 +342,7 @@ async def run_generation_loop():
                         asyncio.to_thread(
                             state.vllm_client.chat,
                             prompt=config.audio_prompt if config.modality == "audio" else config.vision_prompt,
-                            images=pil_images if pil_images else None,
+                            images=pil_images if len(pil_images) != 0 else None,
                             audio= audio_data,
                             audio_sr=config.audio_sample_rate,
                             max_tokens=config.max_new_tokens,
@@ -361,27 +358,6 @@ async def run_generation_loop():
                     continue
 
                 t_gen_end = time.perf_counter()
-
-                # Append to history and trim
-                state.generation_history.append(generated_text)
-                while len(state.generation_history) > 3:
-                    state.generation_history.popleft()
-
-                 
-                # Reconstruct prompt with history
-                if config.modality == "vision":
-                    config.vision_prompt = """
-                        You are an expert video analysis provider that balances detail and broad understanding of video provided.
-                        Describe the video frame in context of previous frames.  First sentence should be what changed, next list details of the frame to use for reference in next frame analysis.
-                        Do not include leading text like 'this image shows', 'this video depicts', After the first run you will get result of a pass through the model. Compare the previous understanding
-                        and create the new one based on interpretations for history. Instead, merge the histories into a continuous, flowing storyline.Focus on the core events, actions, and changes across
-                        histories. Ignore irrelevant or redundant details. Present the story in a way that feels natural, consistent, and temporally connected. Ensure that each new request builds on the prior understanding.
-                        Example response:
-                        The individual remains in similar position looking at the camera.  Background is plain, individual is a man, wearing read shirt, glasses, white earbuds in ears.
-                        A rabbit has entered the scene from the left.  Tall trees, wet ground, fog in the distance.
-                        """
-                    for i, history_text in enumerate(state.generation_history):
-                        config.vision_prompt += f"\nHistory {i+1}: {history_text}"
 
                 payload = {
                     "type": "generation",
@@ -399,7 +375,7 @@ async def run_generation_loop():
                 }
                 try:
                     # Do we send both uncorrected and corrected payload for audio?
-                    if not config.correction_enabled or config.modality=="vision":
+                    if not config.correction_enabled:
                         await state.processor.send_data(json.dumps(payload))
                         logger.info("Published generation payload to data_url.")
                 except Exception as e:
@@ -410,8 +386,7 @@ async def run_generation_loop():
                 # Follow-up: text-only correction using rolling history
                 try:
                     if (
-                        config.modality == 'audio'
-                        and config.correction_enabled
+                        config.correction_enabled
                         and isinstance(generated_text, str)
                         and generated_text.strip() != ""):
 
@@ -424,11 +399,17 @@ async def run_generation_loop():
 
                         # Build correction prompt
                         prev_history = list(state.generation_history)[:-1]
-                        corr_prompt = build_correction_prompt(
-                            history=prev_history,
-                            latest=latest_raw,
-                            system_hint=config.correction_system_hint,
-                        )
+                        if config.modality=="vision":
+                            corr_prompt= vision_correction_prompt(
+                                history=prev_history,
+                                latest=latest_raw
+                            )
+                        else:
+                            corr_prompt = build_correction_prompt(
+                                history=prev_history,
+                                latest=latest_raw,
+                                system_hint=config.correction_system_hint,
+                            )
 
                         t_corr_start = time.perf_counter()
                         corrected_text = await asyncio.wait_for(
@@ -445,11 +426,10 @@ async def run_generation_loop():
                         t_corr_end = time.perf_counter()
 
                         corr_payload = {
-                            "type": "transcription_correction",
+                            "type": "correction",
                             "timestamp_ms": int(time.time() * 1000),
                             "cycle_id": cycle_id,
                             "history_len": len(prev_history),
-                            "latest_raw": latest_raw,
                             "corrected_text": corrected_text,
                             "stats": {
                                 "timings_ms": {
@@ -458,6 +438,11 @@ async def run_generation_loop():
                                 }
                             }
                         }
+
+                        # Append to history and trim
+                        state.generation_history.append(corrected_text)
+                        while len(state.generation_history) > config.history_max_turns:
+                            state.generation_history.popleft()
 
                         try:
                             await state.processor.send_data(json.dumps(corr_payload))
@@ -507,6 +492,38 @@ def build_correction_prompt(
     )
     return "\n".join(lines)
 
+def vision_correction_prompt(
+    history: list[str],
+    latest: str,
+) -> str:
+
+    sys: str = (
+        "You are a video narrative continuation assistant. You will receive [Previous Frames Understanding] "
+        "(up to the last 4 entries) and a [Latest Chunk]. Compare them and produce a concise continuation of the "
+        "same story, not a new caption. Include only genuinely new information or state changes from the latest frame; "
+        "omit anything already established. Keep entity names and pronouns consistent, maintain the same tense and style, "
+        "and avoid phrases like \"this frame shows\" or \"the image.\" If nothing new is present, return an empty string."
+    )
+    lines: list[str] = []
+    if sys:
+        lines.append(f"[System]\n{sys}\n")
+
+    if history:
+        lines.append("[Previous Frames Understanding]")
+        for h in history[-config.history_max_turns:]:
+            if h.strip():
+                lines.append(f"- {h.strip()}")
+        lines.append("")
+
+    lines.append("[Latest Chunk]")
+    lines.append(latest.strip())
+    lines.append("")
+    lines.append(
+    "Task: Using [Previous Frames Understanding] for context, rewrite [Latest Chunk] as a continuation of the ongoing narrative, "
+    "adding only genuinely new changes or state updates. Write the changes in narration style of david attaborough in 3-4 short sentences, no headings or bullets, no recap. "
+    "If there are no new changes, return an empty string."
+    )
+    return "\n".join(lines)
 # --- Helper Function ----
 
 def get_last_n_seconds_audio(audio_chunks: deque, audio_samples_total: int, n_seconds: float, sample_rate: int) -> np.ndarray | None:

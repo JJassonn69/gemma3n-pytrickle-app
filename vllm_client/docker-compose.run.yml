@@ -10,7 +10,7 @@ services:
       - .env
     # Any args here override default vLLM args in start.sh
     command: >
-      --model google/gemma-3n-E4B-it
+      --model google/gemma-3n-E2B-it
       --dtype bfloat16
       --gpu-memory-utilization 0.90
       --max-model-len 32768
@@ -18,7 +18,6 @@ services:
     environment:
       - HF_HOME=/data/hf
       - HUGGINGFACE_HUB_CACHE=/data/hf
-      - TRANSFORMERS_CACHE=/data/hf
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - HUGGINGFACEHUB_API_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
